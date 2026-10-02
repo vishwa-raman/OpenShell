@@ -8893,6 +8893,7 @@ mod tests {
                 gateway_expires_at: 1,
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
+                ssh_host_private_key: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {
