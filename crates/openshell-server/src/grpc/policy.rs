@@ -3394,7 +3394,11 @@ fn canonical_endpoint_path(path: &str) -> String {
 }
 
 pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = false;
         }
@@ -3405,7 +3409,11 @@ fn stamp_provider_credentialed_endpoints(
     policy: &mut ProtoSandboxPolicy,
     scopes: &[CredentialedEndpointScope],
 ) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = scopes
                 .iter()
@@ -3772,6 +3780,14 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
+            // A global policy replaces every sandbox's policy, and a sandbox
+            // cannot switch formats after it starts, so a Cedar global policy
+            // would be rejected by every YAML sandbox.
+            if !new_policy.cedar_policy_source.is_empty() {
+                return Err(Status::invalid_argument(
+                    "global policies must be YAML; Cedar policies can only be set per sandbox",
+                ));
+            }
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
@@ -4600,7 +4616,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     .map_err(Status::internal)?;
     if crate::compute::provisioning_deadline::timed_out(&sandbox) {
         return Err(Status::failed_precondition(
-            "provisioning repair window expired; explicitly start the sandbox after cleanup",
+            "provisioning deadline expired; explicitly start the sandbox after cleanup",
         ));
     }
     let current = sandbox
@@ -4686,10 +4702,10 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .claim_provisioning_timeout(&sandbox, now_ms)
                 .await
                 .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "provisioning repair window expired",
-            ));
+            return Err(Status::failed_precondition("provisioning deadline expired"));
         }
+        crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
+            .map_err(Status::internal)?;
         if reported == ConfigurationAdmissionState::Rejected {
             crate::compute::provisioning_deadline::record_rejection(record, now_ms)
                 .map_err(Status::internal)?;
@@ -7907,6 +7923,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_registration_starts_repair_once_after_a_cold_start() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+        use openshell_core::time::timestamp_to_millis;
+        let state = test_server_state().await;
+        let sandbox_id = "sb-cold-registration";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "cold-registration",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800);
+        sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let request = || {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: instance_id.clone(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            )
+        };
+        // A duplicate report racing the initial registration must share one
+        // persisted transition; either may acquire the lifecycle fence first.
+        let (first, duplicate) = tokio::join!(
+            handle_report_sandbox_configuration(&state, request()),
+            handle_report_sandbox_configuration(&state, request()),
+        );
+        first.unwrap();
+        duplicate.unwrap();
+        let saved = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let record = saved
+            .status
+            .as_ref()
+            .unwrap()
+            .provisioning
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            record.preparation_deadline,
+            preparation.preparation_deadline
+        );
+        let start = timestamp_to_millis(record.admission_start_time.as_ref().unwrap()).unwrap();
+        let deadline = timestamp_to_millis(record.deadline.as_ref().unwrap()).unwrap();
+        assert_eq!(deadline - start, 300_000);
+        handle_report_sandbox_configuration(&state, request())
+            .await
+            .unwrap();
+        let repeated = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repeated
+                .status
+                .as_ref()
+                .unwrap()
+                .provisioning
+                .as_ref()
+                .unwrap(),
+            record
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_expiry_rejects_registration_before_the_scanner_runs() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-expired-preparation";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "expired-preparation",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        sandbox.status.as_mut().unwrap().provisioning = Some(new_preparation_record(0, 1800));
+        state.store.put_message(&sandbox).await.unwrap();
+        let error = handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: uuid::Uuid::new_v4().to_string(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let expired = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+        let status = expired.status.unwrap();
+        assert!(status.provisioning.unwrap().admission_start_time.is_none());
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ImagePreparationTimedOut")
+        );
+    }
+
+    #[tokio::test]
     async fn provisioning_timeout_rejects_supervisor_registration() {
         use openshell_core::proto::{
             ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
@@ -7944,7 +8097,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("repair window expired"));
+        assert!(error.message().contains("provisioning deadline expired"));
     }
 
     #[tokio::test]
@@ -11896,6 +12049,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_config_delivers_provider_rules_separately_for_a_cedar_policy() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-provider",
+                "cedar-provider",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-cedar-provider").await;
+
+        assert!(
+            effective_policy.network_policies.is_empty(),
+            "provider rules must not be composed into a Cedar policy"
+        );
+        let rule = effective_policy
+            .provider_credential_rules
+            .get("_provider_work_github")
+            .expect("provider rules travel in provider_credential_rules");
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.provider_credentialed),
+            "credentialed endpoints must be stamped"
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
         use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
@@ -13088,6 +13291,62 @@ mod tests {
                 .files
                 .get("/run/openshell/providers/work-config/client.toml"),
             Some(&"endpoint = 'https://config.example'".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_delivers_bound_credentials_to_a_cedar_sandbox() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-env",
+                "cedar-env",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-cedar-env".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .expect("provider environment must resolve for a Cedar sandbox")
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        let binding = response
+            .static_credential_bindings
+            .get("GITHUB_TOKEN")
+            .expect("credential must stay bound to the provider's endpoints");
+        assert!(
+            binding
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
         );
     }
 
@@ -14802,7 +15061,7 @@ mod tests {
             chunks.push(chunk);
         }
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -14818,7 +15077,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -14938,7 +15197,7 @@ mod tests {
         .map(Option::unwrap)
         .collect::<Vec<_>>();
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -14954,7 +15213,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15139,7 +15398,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -15153,7 +15412,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15170,7 +15429,7 @@ mod tests {
             "pending"
         );
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -15184,7 +15443,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15295,7 +15554,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -15305,7 +15564,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15362,7 +15621,7 @@ mod tests {
             .await
             .unwrap();
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -15372,7 +15631,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -20719,6 +20978,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_global_policy_rejects_cedar_policy() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(ProtoSandboxPolicy {
+                    version: 1,
+                    cedar_policy_source: "permit(principal, \
+                        action == Sandbox::Action::\"NetworkConnect\", \
+                        resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                        .to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a Cedar global policy must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Cedar"), "{}", err.message());
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_reserved_provider_key() {
         let state = test_server_state().await;
 
@@ -23345,7 +23629,7 @@ mod tests {
             err.code()
         );
 
-        let err = handle_approve_all_draft_chunks(
+        let err = Box::pin(handle_approve_all_draft_chunks(
             &state,
             non_member_request(ApproveAllDraftChunksRequest {
                 sandbox: ("any").to_string(),
@@ -23354,7 +23638,7 @@ mod tests {
                 )),
                 ..Default::default()
             }),
-        )
+        ))
         .await
         .unwrap_err();
         assert_eq!(

@@ -126,14 +126,23 @@ mod tests {
     // inventories; the provider-environment file map is public-only. The
     // request has no provider-file capability field: older supervisors ignore
     // the additive file map while retaining the rest of the response.
+    // Preparation timing adds two optional timestamps to SandboxProvisioning.
+    // Existing rows decode with both absent and retain their active deadline;
+    // no stored attempt gains another phase or time budget on upgrade.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // Driver-operation ownership adds pending and a retained operation ID to
+    // SandboxProvisioning in both closures. Old rows decode false and empty;
+    // decoding or deadline updates cannot claim an existing attempt.
+    // Cedar policies add cedar_policy_source and the gateway-managed
+    // provider_credential_rules map to SandboxPolicy in both closures. Existing
+    // rows decode both empty and remain YAML policies.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2e156c6ad3c8eb51bcd30dc13b173fe339b38207a1b1f98f7be2e0cad8e3bd45";
+        "6b87e28acfc08df63ed3d7158947f024a9ed147e65ec9cbb6a3d1e408d6881fa";
     const DURABLE_SCHEMA_SHA256: &str =
-        "38165d9d76f49fcfe98a12f241e032838a2376c1d1a87ea2796fd33b9b1a3541";
+        "eb72e26c01aaf6df3cf73c2665b9d58ebcee0455a279a1be5c01f9afdfc36fcd";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "12c8ccc39282317fd886ed86de86092150db97cc2fbefb1d09d6b13cefff86e6";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -598,9 +607,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 27),
-                (93, 21),
-                (81, 21),
+                (307, 27),
+                (94, 21),
+                (82, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

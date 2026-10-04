@@ -440,6 +440,7 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
+    pub middleware: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
     pub expose_authorization_mode: ServiceAuthorizationMode,
@@ -470,6 +471,7 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
+            middleware: None,
             forward: None,
             expose: None,
             expose_authorization_mode: ServiceAuthorizationMode::Strip,
@@ -508,6 +510,7 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
+        middleware,
         forward,
         expose,
         expose_authorization_mode,
@@ -605,7 +608,7 @@ pub async fn sandbox_create(
         ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
             .await?;
 
-    let policy = load_sandbox_policy(policy)?;
+    let policy = load_sandbox_policy_with_middleware(policy, middleware)?;
     let resource_limits = if template.is_none() {
         build_sandbox_resource_limits(cpu, memory)?
     } else {
@@ -800,11 +803,8 @@ pub async fn sandbox_create(
     // Non-interactive mode: track start time for timestamps.
     let provision_start = Instant::now();
 
-    // Don't use stop_on_terminal on the server — the Kubernetes CRD may
-    // briefly report a stale Ready status before the controller reconciles
-    // a newly created sandbox.  Instead we handle termination client-side:
-    // we wait until we have observed at least one non-Ready phase followed
-    // by Ready (a genuine Provisioning → Ready transition).
+    // Handle terminal states here so a provisional container exit can wait
+    // for the supervisor's canonical-process result before cleanup.
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_workspace = sandbox.object_workspace().to_string();
     let mut stream = client
@@ -832,8 +832,6 @@ pub async fn sandbox_create(
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
-    // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -911,10 +909,6 @@ pub async fn sandbox_create(
                     last_condition_message = Some(message);
                 }
 
-                if phase != SandboxPhase::Ready {
-                    saw_non_ready = true;
-                }
-
                 let main_process_result = has_main_process_result(&s);
                 if matches!(
                     phase,
@@ -949,9 +943,10 @@ pub async fn sandbox_create(
                     break;
                 }
 
-                // Only accept Ready as terminal after we've observed a
-                // non-Ready phase, proving the controller has reconciled.
-                if saw_non_ready && phase == SandboxPhase::Ready {
+                // The gateway owns readiness. Its initial watch snapshot may
+                // already be Ready if provisioning finished before CREATE
+                // returned; requiring an earlier phase would miss that state.
+                if phase == SandboxPhase::Ready {
                     if let Some(d) = display.as_interactive_mut() {
                         d.clear();
                     }
@@ -1218,25 +1213,31 @@ pub async fn sandbox_create(
         SandboxPhase::Error => {
             drop(stream);
             drop(client);
-            let provisioning_timed_out = last_sandbox
+            let timed_out_provisioning = last_sandbox
                 .status
                 .as_ref()
                 .and_then(|status| status.provisioning.as_ref())
-                .is_some_and(|record| record.timeout_time.is_some());
-            let create_result = if provisioning_timed_out {
-                Err(miette::miette!(
-                    "{last_error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; repair its configuration, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
-                ))
-            } else if last_error_reason.is_empty() {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning"
-                ))
-            } else {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning: {}",
-                    last_error_reason
-                ))
-            };
+                .filter(|record| record.timeout_time.is_some());
+            let create_result = timed_out_provisioning.map_or_else(
+                || {
+                    if last_error_reason.is_empty() {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning"
+                        ))
+                    } else {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning: {}",
+                            last_error_reason
+                        ))
+                    }
+                },
+                |record| {
+                    Err(miette::miette!(
+                        "{}",
+                        retained_sandbox_timeout_message(&sandbox_name, &last_error_reason, record)
+                    ))
+                },
+            );
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
@@ -1257,6 +1258,24 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+/// Use the persisted phase to select recovery guidance. Preparation may expire
+/// before any policy is evaluated, so it must not tell the user to repair policy.
+fn retained_sandbox_timeout_message(
+    sandbox_name: &str,
+    error_reason: &str,
+    record: &openshell_core::proto::SandboxProvisioning,
+) -> String {
+    let recovery = if record.preparation_deadline.is_some() && record.admission_start_time.is_none()
+    {
+        "check image preparation and supervisor startup diagnostics and the gateway's `image_preparation_timeout_seconds` budget"
+    } else {
+        "repair its configuration"
+    };
+    format!(
+        "{error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; {recovery}, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
+    )
 }
 
 /// Resolved source for the `--from` flag on `sandbox create`.
@@ -1514,6 +1533,78 @@ fn merge_rootfs_tar_driver_config(
 /// to apply its own default.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     openshell_policy::load_sandbox_policy(cli_path)
+}
+
+/// Renders a policy for `policy get`.
+///
+/// A YAML policy renders as YAML. A Cedar policy renders as its Cedar text,
+/// followed by its middleware as a separate section, since middleware is
+/// configuration supplied with `--middleware` rather than part of the policy.
+/// When present (the `--full` view), the gateway-managed provider rules follow
+/// in a section of their own; they supply credential settings and grant no
+/// access.
+fn render_policy_text(policy: &SandboxPolicy) -> Result<String> {
+    let mut text = openshell_policy::serialize_sandbox_policy(policy)
+        .wrap_err("failed to serialize policy")?;
+    if policy.cedar_policy_source.is_empty() {
+        return Ok(text);
+    }
+    if let Some(middleware) = openshell_policy::serialize_network_middlewares(policy)
+        .wrap_err("failed to serialize middleware")?
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("---\n# Middleware (set with --middleware)\n");
+        text.push_str(&middleware);
+    }
+    if let Some(rules) = openshell_policy::serialize_provider_credential_rules(policy)
+        .wrap_err("failed to serialize provider credential rules")?
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(
+            "---\n# Provider credential rules (managed by the gateway; they grant no access)\n",
+        );
+        text.push_str(&rules);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    Ok(text)
+}
+
+/// The files `policy set` reads: a policy file and an optional middleware file.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyFiles<'a> {
+    /// Path to a YAML or `.cedar` policy file.
+    pub policy: &'a str,
+    /// Path to a middleware file, if any.
+    pub middleware: Option<&'a str>,
+}
+
+impl PolicyFiles<'_> {
+    /// Loads the policy and adds the middleware file, if any.
+    fn load(self) -> Result<SandboxPolicy> {
+        load_sandbox_policy_with_middleware(Some(self.policy), self.middleware)?
+            .ok_or_else(|| miette::miette!("No policy loaded from {}", self.policy))
+    }
+}
+
+/// Loads the policy and adds the middleware from `middleware_path`, if given.
+fn load_sandbox_policy_with_middleware(
+    policy_path: Option<&str>,
+    middleware_path: Option<&str>,
+) -> Result<Option<SandboxPolicy>> {
+    let mut policy = load_sandbox_policy(policy_path)?;
+    if let Some(middleware_path) = middleware_path {
+        let policy = policy.as_mut().ok_or_else(|| {
+            miette::miette!("--middleware requires a policy (--policy or OPENSHELL_SANDBOX_POLICY)")
+        })?;
+        openshell_policy::apply_middleware_file(policy, Path::new(middleware_path))?;
+    }
+    Ok(policy)
 }
 
 /// Sync files to or from a sandbox.
@@ -2304,7 +2395,6 @@ async fn forward_one_tcp_connection(
     service_id: String,
     authorization_token: String,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::wrappers::ReceiverStream;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
@@ -2325,7 +2415,7 @@ async fn forward_one_tcp_connection(
     .await
     .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
 
-    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
+    let response = match client.forward_tcp(ReceiverStream::new(rx)).await {
         Ok(response) => response.into_inner(),
         Err(status) => {
             let err = ForwardTcpConnectionError::from_status(status);
@@ -2334,7 +2424,27 @@ async fn forward_one_tcp_connection(
         }
     };
 
-    let (mut local_read, mut local_write) = socket.into_split();
+    let (local_read, local_write) = socket.into_split();
+    relay_local_socket(local_read, local_write, tx, response).await
+}
+
+/// Relay bytes between a local socket and a forward stream.
+///
+/// When the target closes first, half-close the local socket but keep sending
+/// client data until the client closes, so a target that only half-closes
+/// still receives the rest of the request.
+async fn relay_local_socket<R, W, S>(
+    mut local_read: R,
+    mut local_write: W,
+    tx: tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    mut response: S,
+) -> std::result::Result<(), ForwardTcpConnectionError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+    S: tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let to_gateway = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -2359,8 +2469,9 @@ async fn forward_one_tcp_connection(
     });
 
     while let Some(frame) = response
-        .message()
+        .next()
         .await
+        .transpose()
         .map_err(ForwardTcpConnectionError::from_status)?
     {
         let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
@@ -2377,7 +2488,7 @@ async fn forward_one_tcp_connection(
     }
 
     let _ = local_write.shutdown().await;
-    to_gateway.abort();
+    let _ = to_gateway.await;
     Ok(())
 }
 
@@ -2506,7 +2617,7 @@ async fn sandbox_exec_streaming_grpc(
                     if forwarded > MAX_EXEC_STDIN_BYTES {
                         return Err(std::io::Error::new(
                             ErrorKind::InvalidInput,
-                            piped_stdin_limit_error().to_string(),
+                            "streamed stdin exceeds the 4 MiB limit; the command may have processed partial input; use `sandbox upload` for larger input",
                         ));
                     }
                     if stdin_tx
@@ -2648,7 +2759,9 @@ async fn sandbox_exec_streaming_grpc(
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
                 exit_seen = true;
-                break;
+                // Process exit does not complete the RPC. Keep draining so a
+                // failing final gRPC status cannot turn partial output into
+                // a successful execution result.
             }
             None => {}
         }
@@ -2902,11 +3015,22 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             "configuration_change_id": record.configuration_change_id,
             "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
             "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "phase": if record.deadline.is_none() && record.timeout_time.is_none() {
+                "ready"
+            } else if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                "preparation"
+            } else {
+                "admission"
+            },
+            "preparation_deadline": record.preparation_deadline.as_ref().map(ToString::to_string),
+            "admission_start_time": record.admission_start_time.as_ref().map(ToString::to_string),
             "deadline": record.deadline.as_ref().map(ToString::to_string),
             "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
             "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
             "cleanup_error": record.cleanup_error,
             "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+            "driver_operation_pending": record.driver_operation_pending,
+            "driver_operation_id": record.driver_operation_id,
         }));
     serde_json::json!({
         "id": sandbox.object_id(),
@@ -4978,7 +5102,7 @@ pub async fn sandbox_upload(
 
 pub async fn sandbox_policy_set_global(
     server: &str,
-    policy_path: &str,
+    files: PolicyFiles<'_>,
     yes: bool,
     wait: bool,
     _timeout_secs: u64,
@@ -4993,8 +5117,7 @@ pub async fn sandbox_policy_set_global(
 
     confirm_global_setting_takeover("policy", yes)?;
 
-    let policy = load_sandbox_policy(Some(policy_path))?
-        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
+    let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
     let response = client
@@ -5323,14 +5446,13 @@ pub async fn sandbox_setting_delete(
 pub async fn sandbox_policy_set(
     server: &str,
     name: &str,
-    policy_path: &str,
+    files: PolicyFiles<'_>,
     wait: bool,
     timeout_secs: u64,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let policy = load_sandbox_policy(Some(policy_path))?
-        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
+    let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
 
@@ -5744,8 +5866,7 @@ where
             if let Some(ref policy) = rev.policy {
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
                 writeln!(stderr, "Policy payload not available for this version")
@@ -5852,8 +5973,7 @@ where
             if view.includes_policy() {
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             }
         }
@@ -5914,8 +6034,7 @@ pub async fn sandbox_policy_get_global(
             if let Some(ref policy) = rev.policy {
                 println!("---");
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 print!("{yaml_str}");
             } else {
                 eprintln!("Policy payload not available for this version");
@@ -6000,9 +6119,7 @@ fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, Sandb
     }
 
     let mut base_policy = policy.clone();
-    base_policy
-        .network_policies
-        .retain(|name, _| !openshell_policy::is_provider_rule_name(name));
+    openshell_policy::strip_provider_rule_names(&mut base_policy);
     Cow::Owned(base_policy)
 }
 
@@ -6691,15 +6808,17 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
-        format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json,
-        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
-        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
-        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
-        sandbox_upload_plan, service_endpoint_to_json, service_expose_status_error,
-        service_url_for_gateway, workspace_member_to_json,
+        ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
+        format_endpoint, format_log_line, git_sync_files, has_main_process_result,
+        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
+        parse_secret_material_env_pairs, policy_for_view, policy_revision_list_json,
+        policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
+        ready_false_condition_message, relay_local_socket, render_policy_text, resolve_from,
+        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
+        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
+        workspace_member_to_json,
     };
+    use openshell_core::proto::TcpForwardFrame;
 
     #[test]
     fn draft_approval_error_explains_refreshed_evaluation() {
@@ -8109,6 +8228,101 @@ mod tests {
     }
 
     #[test]
+    fn retained_sandbox_timeout_message_matches_expired_phase() {
+        let mut record = openshell_core::proto::SandboxProvisioning {
+            preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            ..Default::default()
+        };
+        let message = super::retained_sandbox_timeout_message(
+            "cold-image",
+            "ImagePreparationTimedOut: preparation expired",
+            &record,
+        );
+        assert!(message.starts_with("ImagePreparationTimedOut: preparation expired\n"));
+        assert!(message.contains("Sandbox 'cold-image' was retained"));
+        assert!(message.contains("image preparation and supervisor startup diagnostics"));
+        assert!(message.contains("image_preparation_timeout_seconds"));
+        assert!(!message.contains("repair its configuration"));
+        assert!(message.contains("openshell sandbox get cold-image"));
+        assert!(message.contains("openshell sandbox start cold-image` after cleanup completes"));
+
+        // An admission timeout retains preparation timestamps. Its completed
+        // transition must select configuration repair rather than a larger budget.
+        record.admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        let admission_without_preparation = openshell_core::proto::SandboxProvisioning {
+            timeout_time: record.timeout_time,
+            ..Default::default()
+        };
+        for admission_record in [&record, &admission_without_preparation] {
+            let message = super::retained_sandbox_timeout_message(
+                "invalid-policy",
+                "ProvisioningTimedOut: repair window expired",
+                admission_record,
+            );
+            assert!(message.contains("repair its configuration"));
+            assert!(!message.contains("image_preparation_timeout_seconds"));
+            assert!(
+                message.contains("openshell sandbox start invalid-policy` after cleanup completes")
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_exposes_pending_driver_operation() {
+        for pending in [true, false] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning.into());
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(openshell_core::proto::SandboxProvisioning {
+                    driver_operation_pending: pending,
+                    driver_operation_id: "operation-1".into(),
+                    ..Default::default()
+                });
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_pending"],
+                pending
+            );
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_id"],
+                "operation-1"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_distinguishes_preparation_and_admission() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let ceiling = openshell_core::time::timestamp_from_millis(1_800_000).ok();
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                preparation_deadline: ceiling,
+                deadline: ceiling,
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["phase"], "preparation");
+        assert_eq!(
+            json["provisioning"]["preparation_deadline"],
+            "1970-01-01T00:30:00Z"
+        );
+        assert!(json["provisioning"]["admission_start_time"].is_null());
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        assert_eq!(
+            super::sandbox_to_json(&sandbox)["provisioning"]["phase"],
+            "admission"
+        );
+    }
+
+    #[test]
     fn sandbox_json_exposes_repair_diagnostic_and_accepted_generation() {
         use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
 
@@ -8523,6 +8737,87 @@ mod tests {
         assert!(format_log_line(&log).ends_with(message));
     }
 
+    fn forward_data(bytes: &[u8]) -> TcpForwardFrame {
+        TcpForwardFrame {
+            payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                bytes.to_vec(),
+            )),
+        }
+    }
+
+    struct Relay {
+        client: tokio::io::DuplexStream,
+        to_gateway: tokio::sync::mpsc::Receiver<TcpForwardFrame>,
+        response: tokio::sync::mpsc::Sender<Result<TcpForwardFrame, Status>>,
+        task: tokio::task::JoinHandle<Result<(), ForwardTcpConnectionError>>,
+    }
+
+    fn start_relay() -> Relay {
+        let (client, local) = tokio::io::duplex(4096);
+        let (local_read, local_write) = tokio::io::split(local);
+        let (tx, to_gateway) = tokio::sync::mpsc::channel(16);
+        let (response, resp_rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(relay_local_socket(
+            local_read,
+            local_write,
+            tx,
+            tokio_stream::wrappers::ReceiverStream::new(resp_rx),
+        ));
+        Relay {
+            client,
+            to_gateway,
+            response,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_keeps_client_upload_after_target_half_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut relay = start_relay();
+        relay
+            .response
+            .send(Ok(forward_data(b"ready")))
+            .await
+            .unwrap();
+        drop(relay.response);
+
+        let mut greeting = [0u8; 5];
+        relay.client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting, b"ready");
+
+        relay.client.write_all(b"upload").await.unwrap();
+        relay.client.shutdown().await.unwrap();
+
+        let mut uploaded = Vec::new();
+        while let Some(frame) = relay.to_gateway.recv().await {
+            if let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
+                frame.payload
+            {
+                uploaded.extend(data);
+            }
+        }
+        assert_eq!(uploaded, b"upload");
+        relay.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_half_closes_local_socket_when_target_closes() {
+        use tokio::io::AsyncReadExt;
+
+        let mut relay = start_relay();
+        relay.response.send(Ok(forward_data(b"bye"))).await.unwrap();
+        drop(relay.response);
+
+        let mut received = Vec::new();
+        relay.client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"bye");
+
+        drop(relay.client);
+        relay.task.await.unwrap().unwrap();
+    }
+
     use std::io::Write as _;
     use std::time::{Duration, Instant};
 
@@ -8599,5 +8894,61 @@ mod tests {
             .err()
             .expect("over the limit must fail");
         assert!(error.to_string().contains("sandbox upload"), "{error}");
+    }
+
+    #[test]
+    fn render_policy_text_shows_cedar_text_then_middleware() {
+        let source = "permit (principal, action == Sandbox::Action::\"NetworkConnect\", \
+                      resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");";
+        let mut policy = SandboxPolicy {
+            version: 1,
+            cedar_policy_source: source.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(render_policy_text(&policy).expect("render"), source);
+
+        policy.network_middlewares.insert(
+            "guard".to_string(),
+            openshell_core::proto::NetworkMiddlewareConfig {
+                middleware: "openshell/regex".to_string(),
+                order: 10,
+                ..Default::default()
+            },
+        );
+        let rendered = render_policy_text(&policy).expect("render");
+        let (cedar, middleware) = rendered
+            .split_once("---\n")
+            .expect("middleware is a separate section");
+        assert_eq!(cedar.trim_end(), source);
+        assert!(middleware.contains("network_middlewares:"), "{middleware}");
+        assert!(middleware.contains("guard"), "{middleware}");
+
+        policy.provider_credential_rules.insert(
+            "_provider_work".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    provider_credentialed: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let full = render_policy_text(&policy_for_view(&policy, PolicyGetView::Full))
+            .expect("render full view");
+        let sections: Vec<&str> = full.split("---\n").collect();
+        assert_eq!(sections.len(), 3, "{full}");
+        assert!(
+            sections[2].contains("# Credentialed endpoints: pypi.org:443"),
+            "{full}"
+        );
+        assert!(sections[2].contains("_provider_work"), "{full}");
+
+        let base = render_policy_text(&policy_for_view(&policy, PolicyGetView::Base))
+            .expect("render base view");
+        assert!(!base.contains("provider_credential_rules"), "{base}");
+        assert!(base.contains("network_middlewares:"), "{base}");
     }
 }
